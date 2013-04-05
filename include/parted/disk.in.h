@@ -209,6 +209,9 @@ struct _PedDiskOps {
         int (*disk_is_flag_available) (
                 const PedDisk *disk,
                 PedDiskFlag flag);
+        int (*disk_set_partitions_offset) (
+                const PedDisk *disk,
+                PedSector offset);
         /** \todo add label guessing op here */
 
         /* partition operations */

@@ -265,6 +265,7 @@ struct __attribute__ ((packed)) _GPTDiskData
   int entry_count;
   efi_guid_t uuid;
   int pmbr_boot;
+  int partitions_offset;
 };
 
 /* uses libparted's disk_specific field in PedPartition, to store our info */
@@ -537,6 +538,7 @@ gpt_alloc (const PedDevice *dev)
   uuid_generate ((unsigned char *) &gpt_disk_data->uuid);
   swap_uuid_and_efi_guid ((unsigned char *) (&gpt_disk_data->uuid));
   gpt_disk_data->pmbr_boot = 0;
+  gpt_disk_data->partitions_offset = 2;
   return disk;
 
 error_free_disk:
@@ -683,13 +685,14 @@ _header_is_valid (PedDisk const *disk, GuidPartitionTableHeader_t *gpt,
 
 static int
 _parse_header (PedDisk *disk, const GuidPartitionTableHeader_t *gpt,
-               int *update_needed)
+               int *update_needed, int use_backup)
 {
   GPTDiskData *gpt_disk_data = disk->disk_specific;
   PedSector first_usable;
   PedSector last_usable;
   PedSector last_usable_if_grown, last_usable_min_default;
   static int asked_already;
+  PedSector offset;
 
 #ifndef DISCOVER_ONLY
   if (PED_LE32_TO_CPU (gpt->Revision) > GPT_HEADER_REVISION_V1_02)
@@ -715,14 +718,25 @@ _parse_header (PedDisk *disk, const GuidPartitionTableHeader_t *gpt,
      If the volume has grown, offer the user the chance to use the new
      space or continue with the current usable area.  Only ask once per
      parted invocation. */
+  if (use_backup)
+    {
+      size_t ss = disk->dev->sector_size;
+      PedSector ptes_bytes = (PED_LE64_TO_CPU (gpt->NumberOfPartitionEntries)
+                              * sizeof (GuidPartitionEntry_t));
+      PedSector ptes_sectors = (ptes_bytes + ss - 1) / ss;
+
+      offset = PED_LE64_TO_CPU (gpt->MyLBA) - ptes_sectors - PED_LE64_TO_CPU (gpt->PartitionEntryLBA) + 1;
+    }
+  else
+      offset = PED_LE64_TO_CPU (gpt->PartitionEntryLBA);
 
   last_usable_if_grown
-    = (disk->dev->length - 2 -
+    = (disk->dev->length - 1 - offset -
        ((PedSector) (PED_LE32_TO_CPU (gpt->NumberOfPartitionEntries)) *
         (PedSector) (PED_LE32_TO_CPU (gpt->SizeOfPartitionEntry)) /
         disk->dev->sector_size));
 
-  last_usable_min_default = disk->dev->length - 2 -
+  last_usable_min_default = disk->dev->length - offset -
     GPT_DEFAULT_PARTITION_ENTRY_ARRAY_SIZE / disk->dev->sector_size;
 
   if (last_usable_if_grown > last_usable_min_default)
@@ -769,7 +783,7 @@ _parse_header (PedDisk *disk, const GuidPartitionTableHeader_t *gpt,
   PED_ASSERT (gpt_disk_data->entry_count <= 8192);
 
   gpt_disk_data->uuid = gpt->DiskGUID;
-
+  gpt_disk_data->partitions_offset = offset;
   return 1;
 }
 
@@ -937,6 +951,7 @@ gpt_read (PedDisk *disk)
   GuidPartitionTableHeader_t *primary_gpt;
   GuidPartitionTableHeader_t *backup_gpt;
   PedSector backup_sector_num;
+  int use_backup = 0;
   int read_failure = gpt_read_headers (disk, &primary_gpt, &backup_gpt,
                                        &backup_sector_num);
   if (read_failure)
@@ -1017,11 +1032,12 @@ gpt_read (PedDisk *disk)
         goto error_free_gpt;
 
       gpt = backup_gpt;
+      use_backup = 1;
     }
   backup_gpt = NULL;
   primary_gpt = NULL;
 
-  if (!_parse_header (disk, gpt, &write_back))
+  if (!_parse_header (disk, gpt, &write_back, use_backup))
     goto error_free_gpt;
 
   size_t ptes_bytes;
@@ -1143,27 +1159,27 @@ _generate_header (const PedDisk *disk, int alternate, uint32_t ptes_crc,
   gpt->HeaderCRC32 = 0;
   gpt->Reserved1 = 0;
 
+  PedSector ptes_bytes = (gpt_disk_data->entry_count
+		          * sizeof (GuidPartitionEntry_t));
+  size_t ptes_sectors = ped_div_round_up (ptes_bytes,
+                                          disk->dev->sector_size);
   if (alternate)
     {
-      size_t ss = disk->dev->sector_size;
-      PedSector ptes_bytes = (gpt_disk_data->entry_count
-			      * sizeof (GuidPartitionEntry_t));
-      PedSector ptes_sectors = (ptes_bytes + ss - 1) / ss;
 
       gpt->MyLBA = PED_CPU_TO_LE64 (disk->dev->length - 1);
       gpt->AlternateLBA = PED_CPU_TO_LE64 (1);
       gpt->PartitionEntryLBA
-        = PED_CPU_TO_LE64 (disk->dev->length - 1 - ptes_sectors);
+        = PED_CPU_TO_LE64 (disk->dev->length - ptes_sectors - gpt_disk_data->partitions_offset);
     }
   else
     {
       gpt->MyLBA = PED_CPU_TO_LE64 (1);
       gpt->AlternateLBA = PED_CPU_TO_LE64 (disk->dev->length - 1);
-      gpt->PartitionEntryLBA = PED_CPU_TO_LE64 (2);
+      gpt->PartitionEntryLBA = PED_CPU_TO_LE64 (gpt_disk_data->partitions_offset);
     }
 
-  gpt->FirstUsableLBA = PED_CPU_TO_LE64 (gpt_disk_data->data_area.start);
-  gpt->LastUsableLBA = PED_CPU_TO_LE64 (gpt_disk_data->data_area.end);
+  gpt->FirstUsableLBA = PED_CPU_TO_LE64 (gpt_disk_data->partitions_offset + ptes_sectors);
+  gpt->LastUsableLBA = PED_CPU_TO_LE64 (disk->dev->length - ptes_sectors - gpt_disk_data->partitions_offset - 1);
   gpt->DiskGUID = gpt_disk_data->uuid;
   gpt->NumberOfPartitionEntries
     = PED_CPU_TO_LE32 (gpt_disk_data->entry_count);
@@ -1210,6 +1226,7 @@ gpt_write (const PedDisk *disk)
   uint8_t *pth_raw;
   GuidPartitionTableHeader_t *gpt;
   PedPartition *part;
+  int i;
 
   PED_ASSERT (disk != NULL);
   PED_ASSERT (disk->dev != NULL);
@@ -1240,36 +1257,23 @@ gpt_write (const PedDisk *disk)
   if (!_write_pmbr (disk->dev, gpt_disk_data->pmbr_boot))
     goto error_free_ptes;
 
-  /* Write PTH and PTEs */
-  /* FIXME: Caution: this code is nearly identical to what's just below. */
-  if (_generate_header (disk, 0, ptes_crc, &gpt) != 0)
-    goto error_free_ptes;
-  pth_raw = pth_get_raw (disk->dev, gpt);
-  pth_free (gpt);
-  if (pth_raw == NULL)
-    goto error_free_ptes;
-  int write_ok = ped_device_write (disk->dev, pth_raw, 1, 1);
-  free (pth_raw);
-  if (!write_ok)
-    goto error_free_ptes;
-  if (!ped_device_write (disk->dev, ptes, 2, ptes_sectors))
-    goto error_free_ptes;
-
-  /* Write Alternate PTH & PTEs */
-  /* FIXME: Caution: this code is nearly identical to what's just above. */
-  if (_generate_header (disk, 1, ptes_crc, &gpt) != 0)
-    goto error_free_ptes;
-  pth_raw = pth_get_raw (disk->dev, gpt);
-  pth_free (gpt);
-  if (pth_raw == NULL)
-    goto error_free_ptes;
-  write_ok = ped_device_write (disk->dev, pth_raw, disk->dev->length - 1, 1);
-  free (pth_raw);
-  if (!write_ok)
-    goto error_free_ptes;
-  if (!ped_device_write (disk->dev, ptes,
-                         disk->dev->length - 1 - ptes_sectors, ptes_sectors))
-    goto error_free_ptes;
+  /* Write primary and alternate PTH and PTEs */
+  for (i = 0; i < 2; i++)
+    {
+      if (_generate_header (disk, i, ptes_crc, &gpt) != 0)
+        goto error_free_ptes;
+      pth_raw = pth_get_raw (disk->dev, gpt);
+      pth_free (gpt);
+      if (pth_raw == NULL)
+        goto error_free_ptes;
+      int write_ok = ped_device_write (disk->dev, pth_raw, PED_LE64_TO_CPU (gpt->MyLBA), 1);
+      free (pth_raw);
+      if (!write_ok)
+        goto error_free_ptes;
+      if (!ped_device_write (disk->dev, ptes,
+                             PED_LE64_TO_CPU (gpt->PartitionEntryLBA), ptes_sectors))
+        goto error_free_ptes;
+    }
 
   free (ptes);
   return ped_device_sync (disk->dev);
@@ -1840,6 +1844,15 @@ gpt_partition_align (PedPartition *part, const PedConstraint *constraint)
   return 0;
 }
 
+static int
+gpt_disk_set_partitions_offset(const PedDisk *disk, PedSector offset)
+{
+  GPTDiskData *gpt_disk_data = disk->disk_specific;
+
+  gpt_disk_data->partitions_offset = offset;
+  return 1;
+}
+
 #include "pt-common.h"
 PT_define_limit_functions (gpt)
 
@@ -1853,6 +1866,7 @@ static PedDiskOps gpt_disk_ops =
   disk_set_flag:		gpt_disk_set_flag,
   disk_get_flag:		gpt_disk_get_flag,
   disk_is_flag_available:	gpt_disk_is_flag_available,
+  disk_set_partitions_offset:	gpt_disk_set_partitions_offset,
 
   PT_op_function_initializers (gpt)
 };

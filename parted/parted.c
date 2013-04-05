@@ -488,6 +488,10 @@ do_mklabel (PedDevice** dev)
 {
         PedDisk*                disk;
         const PedDiskType*      type = NULL;
+        PedGeometry             *range = NULL;
+        PedSector               offset;
+        char                    *peek_word;
+        int                     set_offset = 0;
 
         ped_exception_fetch_all ();
         disk = ped_disk_new (*dev);
@@ -495,6 +499,17 @@ do_mklabel (PedDevice** dev)
         ped_exception_leave_all ();
 
         if (!command_line_get_disk_type (_("New disk label type?"), &type))
+                goto error;
+
+        peek_word = command_line_peek_word ();
+        if (peek_word && isdigit (peek_word[0])) {
+                if (!command_line_get_sector (_("Offset?"), *dev, &offset, &range, NULL))
+                        goto error;
+                else
+                        set_offset = 1;
+        }
+
+        if (set_offset && !type->ops->disk_set_partitions_offset)
                 goto error;
 
         if (disk) {
@@ -509,6 +524,9 @@ do_mklabel (PedDevice** dev)
         disk = ped_disk_new_fresh (*dev, type);
         if (!disk)
                 goto error;
+
+        if (set_offset && !type->ops->disk_set_partitions_offset(disk, offset))
+                goto error_destroy_disk;
 
         if (!ped_disk_commit (disk))
                 goto error_destroy_disk;
